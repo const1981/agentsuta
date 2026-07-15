@@ -1,0 +1,746 @@
+package com.nxg.agentsuta
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.Uri
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import android.app.Activity
+import android.content.Context
+import android.os.Environment
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
+import java.io.BufferedInputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.BufferedOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+
+class MainActivity : FlutterActivity() {
+    private val CHANNEL = "com.nxg.agentsuta/native"
+    private val EVENT_CHANNEL = "com.nxg.agentsuta/gateway_logs"
+
+    private lateinit var bootstrapManager: BootstrapManager
+    private lateinit var processManager: ProcessManager
+    private var setupDone = false
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+
+        val filesDir = applicationContext.filesDir.absolutePath
+        val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+
+        bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
+        processManager = ProcessManager(filesDir, nativeLibDir)
+
+        if (!setupDone) {
+            setupDone = true
+            Thread {
+                try { bootstrapManager.setupDirectories() } catch (_: Exception) {}
+                try { bootstrapManager.writeResolvConf() } catch (_: Exception) {}
+            }.start()
+        }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getProotPath" -> {
+                    result.success(processManager.getProotPath())
+                }
+                "getArch" -> {
+                    result.success(ArchUtils.getArch())
+                }
+                "getFilesDir" -> {
+                    result.success(filesDir)
+                }
+                "getNativeLibDir" -> {
+                    result.success(nativeLibDir)
+                }
+                "isBootstrapComplete" -> {
+                    result.success(bootstrapManager.isBootstrapComplete())
+                }
+                "getBootstrapStatus" -> {
+                    result.success(bootstrapManager.getBootstrapStatus())
+                }
+                "extractRootfs" -> {
+                    val tarPath = call.argument<String>("tarPath")
+                    if (tarPath != null) {
+                        Thread {
+                            try {
+                                bootstrapManager.extractRootfs(tarPath)
+                                runOnUiThread { result.success(true) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("EXTRACT_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "tarPath required", null)
+                    }
+                }
+                "runInProot" -> {
+                    val command = call.argument<String>("command")
+                    val timeout = call.argument<Int>("timeout")?.toLong() ?: 900L
+                    if (command != null) {
+                        Thread {
+                            try {
+                                val output = processManager.runInProotSync(command, timeout)
+                                runOnUiThread { result.success(output) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("PROOT_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "command required", null)
+                    }
+                }
+                "startGateway" -> {
+                    try {
+                        GatewayService.start(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "stopGateway" -> {
+                    try {
+                        GatewayService.stop(applicationContext)
+                    } catch (_: Exception) {}
+                    // Hard-exit the whole app when stopping the gateway.
+                    // This is the only reliable way to ensure the proot/gateway
+                    // process hierarchy is fully terminated on Android.
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }
+                "isGatewayRunning" -> {
+                    result.success(GatewayService.isProcessAlive())
+                }
+                "startTerminalService" -> {
+                    try {
+                        TerminalSessionService.start(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "stopTerminalService" -> {
+                    try {
+                        TerminalSessionService.stop(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "isTerminalServiceRunning" -> {
+                    result.success(TerminalSessionService.isRunning)
+                }
+                "requestBatteryOptimization" -> {
+                    try {
+                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = Uri.parse("package:${packageName}")
+                        }
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("BATTERY_ERROR", e.message, null)
+                    }
+                }
+                "isBatteryOptimized" -> {
+                    val pm = getSystemService(POWER_SERVICE) as PowerManager
+                    result.success(!pm.isIgnoringBatteryOptimizations(packageName))
+                }
+                "getBatteryStatus" -> {
+                    try {
+                        val batteryIntent =
+                            registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                        if (batteryIntent == null) {
+                            result.error("BATTERY_ERROR", "Battery status unavailable", null)
+                            return@setMethodCallHandler
+                        }
+
+                        val level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                        val scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                        val temperature =
+                            batteryIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+                        val voltage = batteryIntent.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1)
+                        val status = batteryIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                        val plugged = batteryIntent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+
+                        val percentage =
+                            if (level >= 0 && scale > 0) ((level * 100f) / scale).toInt() else -1
+
+                        val statusText = when (status) {
+                            BatteryManager.BATTERY_STATUS_CHARGING -> "CHARGING"
+                            BatteryManager.BATTERY_STATUS_DISCHARGING -> "DISCHARGING"
+                            BatteryManager.BATTERY_STATUS_FULL -> "FULL"
+                            BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "NOT_CHARGING"
+                            else -> "UNKNOWN"
+                        }
+
+                        val pluggedText = when {
+                            (plugged and BatteryManager.BATTERY_PLUGGED_AC) != 0 -> "AC"
+                            (plugged and BatteryManager.BATTERY_PLUGGED_USB) != 0 -> "USB"
+                            (plugged and BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 -> "WIRELESS"
+                            else -> "UNPLUGGED"
+                        }
+
+                        val data = hashMapOf<String, Any>(
+                            "percentage" to percentage,
+                            "level" to level,
+                            "scale" to scale,
+                            "status" to statusText,
+                            "plugged" to pluggedText,
+                            "isCharging" to (
+                                status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                                    status == BatteryManager.BATTERY_STATUS_FULL
+                                ),
+                            "temperatureC" to if (temperature >= 0) temperature / 10.0 else -1.0,
+                            "voltageMv" to voltage,
+                        )
+
+                        result.success(data)
+                    } catch (e: Exception) {
+                        result.error("BATTERY_ERROR", e.message, null)
+                    }
+                }
+                "setupDirs" -> {
+                    Thread {
+                        try {
+                            bootstrapManager.setupDirectories()
+                            runOnUiThread { result.success(true) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("SETUP_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "installEnvironmentFixes" -> {
+                    Thread {
+                        try {
+                            bootstrapManager.installEnvironmentFixes()
+                            runOnUiThread { result.success(true) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("BYPASS_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "writeResolv" -> {
+                    Thread {
+                        try {
+                            bootstrapManager.writeResolvConf()
+                            runOnUiThread { result.success(true) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("RESOLV_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "extractDebPackages" -> {
+                    Thread {
+                        try {
+                            val count = bootstrapManager.extractDebPackages()
+                            runOnUiThread { result.success(count) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("DEB_EXTRACT_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "startSetupService" -> {
+                    try {
+                        SetupService.start(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "updateSetupNotification" -> {
+                    val text = call.argument<String>("text")
+                    val progress = call.argument<Int>("progress") ?: -1
+                    if (text != null) {
+                        SetupService.updateNotification(text, progress)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGS", "text required", null)
+                    }
+                }
+                "stopSetupService" -> {
+                    try {
+                        SetupService.stop(applicationContext)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("SERVICE_ERROR", e.message, null)
+                    }
+                }
+                "showUrlNotification" -> {
+                    val url = call.argument<String>("url")
+                    val title = call.argument<String>("title") ?: "URL Detected"
+                    if (url != null) {
+                        showUrlNotification(url, title)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGS", "url required", null)
+                    }
+                }
+                "copyToClipboard" -> {
+                    val text = call.argument<String>("text")
+                    if (text != null) {
+                        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("URL", text))
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARGS", "text required", null)
+                    }
+                }
+                "vibrate" -> {
+                    val durationMs = call.argument<Int>("durationMs")?.toLong() ?: 200L
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            val vibratorManager =
+                                getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                            val vibrator = vibratorManager.defaultVibrator
+                            vibrator.vibrate(
+                                VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE)
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                vibrator.vibrate(
+                                    VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE)
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                vibrator.vibrate(durationMs)
+                            }
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("VIBRATE_ERROR", e.message, null)
+                    }
+                }
+                "requestStoragePermission" -> {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            if (!Environment.isExternalStorageManager()) {
+                                val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                startActivity(intent)
+                            }
+                        } else {
+                            ActivityCompat.requestPermissions(
+                                this,
+                                arrayOf(
+                                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                                ),
+                                STORAGE_PERMISSION_REQUEST
+                            )
+                        }
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("STORAGE_ERROR", e.message, null)
+                    }
+                }
+                "hasStoragePermission" -> {
+                    val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        Environment.isExternalStorageManager()
+                    } else {
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                    }
+                    result.success(hasPermission)
+                }
+                "getExternalStoragePath" -> {
+                    result.success(Environment.getExternalStorageDirectory().absolutePath)
+                }
+                "readRootfsFile" -> {
+                    val path = call.argument<String>("path")
+                    if (path != null) {
+                        Thread {
+                            try {
+                                val content = bootstrapManager.readRootfsFile(path)
+                                runOnUiThread { result.success(content) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("ROOTFS_READ_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "path required", null)
+                    }
+                }
+                "writeRootfsFile" -> {
+                    val path = call.argument<String>("path")
+                    val content = call.argument<String>("content")
+                    if (path != null && content != null) {
+                        Thread {
+                            try {
+                                bootstrapManager.writeRootfsFile(path, content)
+                                runOnUiThread { result.success(true) }
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("ROOTFS_WRITE_ERROR", e.message, null) }
+                            }
+                        }.start()
+                    } else {
+                        result.error("INVALID_ARGS", "path and content required", null)
+                    }
+                }
+                "backupDataDir" -> {
+                    Thread {
+                        try {
+                            // 备份整套已安装环境（Ubuntu + Python + Hermes + 全部依赖）= 系统镜像，用于一键还原(Ghost 式)
+                            val envDir = File(filesDir, "rootfs/ubuntu")
+                            if (!envDir.exists() || !envDir.isDirectory) {
+                                runOnUiThread {
+                                    result.error("NO_ENV", "未找到已安装环境(rootfs/ubuntu)，请先完成初始化", null)
+                                }
+                                return@Thread
+                            }
+                            val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                Environment.isExternalStorageManager()
+                            } else {
+                                ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                            }
+                            val outDir: File
+                            if (hasPermission) {
+                                val d = File(Environment.getExternalStorageDirectory(), "Download")
+                                if (!d.exists()) d.mkdirs()
+                                outDir = d
+                            } else {
+                                outDir = File(filesDir)
+                            }
+                            val timeFmt = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+                            val zipFile = File(outDir, "hermes-backup-${timeFmt.format(Date())}.zip")
+                            zipDirectory(envDir, zipFile)
+                            runOnUiThread { result.success(zipFile.absolutePath) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("BACKUP_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "packEnvZip" -> {
+                    // 把整套已装环境(rootfs/ubuntu) 打成固定路径 zip，供 App 内局域网下载服务导出
+                    Thread {
+                        try {
+                            val envDir = File(filesDir, "rootfs/ubuntu")
+                            if (!envDir.exists() || !envDir.isDirectory) {
+                                runOnUiThread {
+                                    result.error("NO_ENV", "未找到已安装环境(rootfs/ubuntu)，请先完成初始化", null)
+                                }
+                                return@Thread
+                            }
+                            val zipFile = File(filesDir, "hermes_env.zip")
+                            zipDirectory(envDir, zipFile)
+                            runOnUiThread { result.success(zipFile.absolutePath) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("PACK_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "listBackups" -> {
+                    Thread {
+                        try {
+                            val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                Environment.isExternalStorageManager()
+                            } else {
+                                ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                            }
+                            val dirs = mutableListOf<File>()
+                            if (hasPermission) {
+                                val d = File(Environment.getExternalStorageDirectory(), "Download")
+                                if (d.exists()) dirs.add(d)
+                            }
+                            val priv = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                            if (priv != null && priv.exists()) dirs.add(priv)
+                            val list = mutableListOf<Map<String, Any>>()
+                            for (d in dirs) {
+                                d.listFiles { f -> f.name.startsWith("hermes-backup-") && f.name.endsWith(".zip") }
+                                    ?.forEach { f ->
+                                        list.add(
+                                            mapOf(
+                                                "name" to f.name,
+                                                "path" to f.absolutePath,
+                                                "size" to f.length(),
+                                                "modified" to f.lastModified(),
+                                            ),
+                                        )
+                                    }
+                            }
+                            list.sortByDescending { it["modified"] as Long }
+                            runOnUiThread { result.success(list) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("LIST_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "restoreDataDir" -> {
+                    val path = call.argument<String>("path")
+                    if (path.isNullOrEmpty()) {
+                        result.error("INVALID_ARGS", "path required", null)
+                        return@setMethodCallHandler
+                    }
+                    Thread {
+                        try {
+                            val zipFile = File(path)
+                            if (!zipFile.exists()) {
+                                runOnUiThread { result.error("NO_BACKUP", "备份文件不存在", null) }
+                                return@Thread
+                            }
+                            val envDir = File(filesDir, "rootfs/ubuntu")
+                            if (!envDir.exists()) envDir.mkdirs()
+                            unzipToDir(zipFile, envDir)
+                            runOnUiThread { result.success(true) }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("RESTORE_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "bringToForeground" -> {
+                    try {
+                        val intent = Intent(applicationContext, MainActivity::class.java).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                        }
+                        applicationContext.startActivity(intent)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("FOREGROUND_ERROR", e.message, null)
+                    }
+                }
+                "readSensor" -> {
+                    val sensorType = call.argument<String>("sensor") ?: "accelerometer"
+                    Thread {
+                        try {
+                            val sensorManager =
+                                getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                            val type = when (sensorType) {
+                                "accelerometer" -> Sensor.TYPE_ACCELEROMETER
+                                "gyroscope" -> Sensor.TYPE_GYROSCOPE
+                                "magnetometer" -> Sensor.TYPE_MAGNETIC_FIELD
+                                "barometer" -> Sensor.TYPE_PRESSURE
+                                else -> Sensor.TYPE_ACCELEROMETER
+                            }
+                            val sensor = sensorManager.getDefaultSensor(type)
+                            if (sensor == null) {
+                                runOnUiThread {
+                                    result.error("SENSOR_ERROR", "Sensor $sensorType not available", null)
+                                }
+                                return@Thread
+                            }
+                            var received = false
+                            val listener = object : SensorEventListener {
+                                override fun onSensorChanged(event: SensorEvent?) {
+                                    if (received || event == null) return
+                                    received = true
+                                    sensorManager.unregisterListener(this)
+                                    val data = hashMapOf<String, Any>(
+                                        "sensor" to sensorType,
+                                        "timestamp" to event.timestamp,
+                                        "accuracy" to event.accuracy
+                                    )
+                                    when (sensorType) {
+                                        "accelerometer", "gyroscope", "magnetometer" -> {
+                                            data["x"] = event.values[0].toDouble()
+                                            data["y"] = event.values[1].toDouble()
+                                            data["z"] = event.values[2].toDouble()
+                                        }
+                                        "barometer" -> {
+                                            data["pressure"] = event.values[0].toDouble()
+                                        }
+                                    }
+                                    runOnUiThread { result.success(data) }
+                                }
+                                override fun onAccuracyChanged(s: Sensor?, accuracy: Int) {}
+                            }
+                            sensorManager.registerListener(
+                                listener, sensor, SensorManager.SENSOR_DELAY_NORMAL
+                            )
+                            Thread.sleep(3000)
+                            if (!received) {
+                                sensorManager.unregisterListener(listener)
+                                runOnUiThread {
+                                    result.error("SENSOR_ERROR", "Sensor read timed out", null)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            runOnUiThread { result.error("SENSOR_ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
+                "restartGateway" -> {
+                    // 保存配置后自动重启网关（对标 1Panel 的「保存并重启网关」）。
+                    // 注意：不能走 stopGateway 通道——那会 killProcess 杀掉整个 App。
+                    // 这里只停掉 Service（杀死内部 python 网关进程，不杀 App），
+                    // 等端口释放后再启动新 Service，让 Hermes 重新加载 .env 配置。
+                    try {
+                        GatewayService.stop(applicationContext)
+                        Thread {
+                            try { Thread.sleep(2000) } catch (_: Exception) {}
+                            try {
+                                GatewayService.start(applicationContext)
+                            } catch (e: Exception) {
+                                runOnUiThread { result.error("RESTART_ERROR", e.message, null) }
+                                return@Thread
+                            }
+                            runOnUiThread { result.success(true) }
+                        }.start()
+                    } catch (e: Exception) {
+                        runOnUiThread { result.error("RESTART_ERROR", e.message, null) }
+                    }
+                }
+                else -> {
+                    result.notImplemented()
+                }
+            }
+        }
+
+        createUrlNotificationChannel()
+        requestNotificationPermission()
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    GatewayService.logSink = events
+                }
+                override fun onCancel(arguments: Any?) {
+                    GatewayService.logSink = null
+                }
+            }
+        )
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                    NOTIFICATION_PERMISSION_REQUEST
+                )
+            }
+        }
+    }
+
+    private fun createUrlNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                URL_CHANNEL_ID,
+                "SutaAgent URLs",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Notifications for detected URLs"
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private var urlNotificationId = 100
+
+    private fun showUrlNotification(url: String, title: String) {
+        val openIntent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        val openPending = PendingIntent.getActivity(
+            this, urlNotificationId, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, URL_CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(url)
+                .setSmallIcon(android.R.drawable.ic_menu_share)
+                .setContentIntent(openPending)
+                .setAutoCancel(true)
+                .setStyle(Notification.BigTextStyle().bigText(url))
+                .build()
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+                .setContentTitle(title)
+                .setContentText(url)
+                .setSmallIcon(android.R.drawable.ic_menu_share)
+                .setContentIntent(openPending)
+                .setAutoCancel(true)
+                .build()
+        }
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(urlNotificationId++, notification)
+    }
+
+    private fun zipDirectory(sourceDir: File, zipFile: File) {
+        val buffer = ByteArray(1024 * 1024)
+        ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zos ->
+            val base = sourceDir.absolutePath.length + 1
+            sourceDir.walkTopDown().forEach { file ->
+                if (!file.isFile) return@forEach
+                val relative = file.absolutePath.substring(base)
+                zos.putNextEntry(ZipEntry(relative))
+                FileInputStream(file).use { fis ->
+                    BufferedInputStream(fis).use { bis ->
+                        var len: Int
+                        while (bis.read(buffer).also { len = it } > 0) {
+                            zos.write(buffer, 0, len)
+                        }
+                    }
+                }
+                zos.closeEntry()
+            }
+        }
+    }
+
+    private fun unzipToDir(zipFile: File, destDir: File) {
+        ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
+            val buffer = ByteArray(1024 * 1024)
+            var entry = zis.nextEntry
+            while (entry != null) {
+                val outFile = File(destDir, entry.name)
+                val destCanonical = destDir.canonicalPath
+                val outCanonical = outFile.canonicalPath
+                if (outCanonical != destCanonical &&
+                    !outCanonical.startsWith(destCanonical + File.separator)) {
+                    throw SecurityException("Illegal zip entry: ${entry.name}")
+                }
+                if (entry.isDirectory) {
+                    outFile.mkdirs()
+                } else {
+                    outFile.parentFile?.mkdirs()
+                    FileOutputStream(outFile).use { fos ->
+                        var len: Int
+                        while (zis.read(buffer).also { len = it } > 0) {
+                            fos.write(buffer, 0, len)
+                        }
+                    }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+    }
+
+    companion object {
+        const val URL_CHANNEL_ID = "hermes_urls"
+        const val NOTIFICATION_PERMISSION_REQUEST = 1001
+        const val STORAGE_PERMISSION_REQUEST = 1002
+    }
+}

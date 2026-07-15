@@ -8,7 +8,7 @@
 - 包名：`com.nxg.agentsuta`
 - 应用名：SutaAgent
 - 官网/下载：`https://Agent.suta.eu.cc`（DNS 由域名商配置）
-- 仓库：`https://github.com/const1981/agentsuta`
+- 仓库：`https://github.com/const1981/sutaagent`
 
 ## 状态
 - 🚧 脚手架阶段（从 `hermes-agent-mobile-zh` v0.3.18 迁移并重命名而来）。
